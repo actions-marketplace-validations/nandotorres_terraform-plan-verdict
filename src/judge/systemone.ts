@@ -91,6 +91,6 @@ export async function judgeWithSystemOne(
     overallScore: aggregate(dimensions),
     dataLossRisk: answers.data_loss_risk.noul,
     dimensions,
-    usage: { inputTokens: usage.input_tokens, outputTokens: usage.output_tokens },
+    usage: { inputTokens: usage.input_tokens ?? 0, outputTokens: usage.output_tokens ?? 0 },
   };
 }

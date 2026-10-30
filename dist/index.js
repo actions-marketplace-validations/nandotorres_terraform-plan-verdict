@@ -5294,7 +5294,7 @@ function defaultFactory (origin, opts) {
 }
 
 class Agent extends DispatcherBase {
-  constructor ({ factory = defaultFactory, maxRedirections = 0, connect, ...options } = {}) {
+  constructor ({ factory = defaultFactory, maxRedirections = 0, connect, tls, ...options } = {}) {
     if (typeof factory !== 'function') {
       throw new InvalidArgumentError('factory must be a function.')
     }
@@ -5313,11 +5313,15 @@ class Agent extends DispatcherBase {
       connect = { ...connect }
     }
 
+    if (tls && typeof tls !== 'function') {
+      tls = { ...tls }
+    }
+
     this[kInterceptors] = options.interceptors?.Agent && Array.isArray(options.interceptors.Agent)
       ? options.interceptors.Agent
       : [createRedirectInterceptor({ maxRedirections })]
 
-    this[kOptions] = { ...util.deepClone(options), connect }
+    this[kOptions] = { ...util.deepClone(options), connect, tls }
     this[kOptions].interceptors = options.interceptors
       ? { ...options.interceptors }
       : undefined
@@ -6350,8 +6354,6 @@ async function connectH1 (client, socket) {
   socket[kParser] = new Parser(client, socket, llhttpInstance)
 
   addListener(socket, 'error', function (err) {
-    assert(err.code !== 'ERR_TLS_CERT_ALTNAME_INVALID')
-
     const parser = this[kParser]
 
     // On Mac OS, we get an ECONNRESET even if there is a full body to be forwarded
@@ -7281,8 +7283,6 @@ async function connectH2 (client, socket) {
   socket[kHTTP2Session] = session
 
   util.addListener(socket, 'error', function (err) {
-    assert(err.code !== 'ERR_TLS_CERT_ALTNAME_INVALID')
-
     this[kError] = err
 
     this[kClient][kOnError](err)
@@ -7356,8 +7356,6 @@ function resumeH2 (client) {
 }
 
 function onHttp2SessionError (err) {
-  assert(err.code !== 'ERR_TLS_CERT_ALTNAME_INVALID')
-
   this[kSocket][kError] = err
   this[kClient][kOnError](err)
 }
@@ -8055,9 +8053,10 @@ class Client extends DispatcherBase {
     // h2
     maxConcurrentStreams,
     allowH2,
-    webSocket
+    webSocket,
+    eventSource
   } = {}) {
-    super({ webSocket })
+    super({ webSocket, eventSource })
 
     if (keepAlive !== undefined) {
       throw new InvalidArgumentError('unsupported keepAlive, use pipelining=0 instead')
@@ -8578,6 +8577,7 @@ module.exports = Client
 
 
 
+const buffer = __nccwpck_require__(4573)
 const Dispatcher = __nccwpck_require__(883)
 const {
   ClientDestroyedError,
@@ -8590,6 +8590,7 @@ const kOnDestroyed = Symbol('onDestroyed')
 const kOnClosed = Symbol('onClosed')
 const kInterceptedDispatch = Symbol('Intercepted Dispatch')
 const kWebSocketOptions = Symbol('webSocketOptions')
+const kEventSourceOptions = Symbol('eventSourceOptions')
 
 class DispatcherBase extends Dispatcher {
   constructor (opts) {
@@ -8600,12 +8601,19 @@ class DispatcherBase extends Dispatcher {
     this[kClosed] = false
     this[kOnClosed] = []
     this[kWebSocketOptions] = opts?.webSocket ?? {}
+    this[kEventSourceOptions] = opts?.eventSource ?? {}
   }
 
   get webSocketOptions () {
     return {
       maxFragments: this[kWebSocketOptions].maxFragments ?? 131072,
       maxPayloadSize: this[kWebSocketOptions].maxPayloadSize ?? 128 * 1024 * 1024
+    }
+  }
+
+  get eventSourceOptions () {
+    return {
+      maxEventSize: this[kEventSourceOptions].maxEventSize ?? buffer.kStringMaxLength
     }
   }
 
@@ -14967,6 +14975,7 @@ module.exports = {
 /***/ ((module, __unused_webpack_exports, __nccwpck_require__) => {
 
 
+const buffer = __nccwpck_require__(4573)
 const { Transform } = __nccwpck_require__(7075)
 const { isASCIINumber, isValidLastEventId } = __nccwpck_require__(4811)
 
@@ -14991,10 +15000,18 @@ const COLON = 0x3A
  */
 const SPACE = 0x20
 
+const defaultMaxEventSize = buffer.kStringMaxLength
+
 const DATA = Buffer.from('data')
 const EVENT = Buffer.from('event')
 const ID = Buffer.from('id')
 const RETRY = Buffer.from('retry')
+
+// Each data field creates a string node, and each unconsumed input chunk keeps
+// a Buffer wrapper. The absolute ceiling protects the large default byte limit.
+const minParserItems = 1024
+const maxParserItems = 131072
+const bytesPerParserItem = 128
 
 function isASCIINumberBytes (buffer, start) {
   if (start >= buffer.length) {
@@ -15032,6 +15049,12 @@ function isFieldName (line, length, field) {
   }
 
   return true
+}
+
+function createMaxEventSizeExceededError () {
+  const error = new Error('EventSource message size exceeded')
+  error.aborted = false
+  return error
 }
 
 /**
@@ -15082,6 +15105,13 @@ class EventSourceStream extends Transform {
   pos = 0
   lineChunkIndex = 0
   linePos = 0
+  lineLength = 0
+  eventSize = 0
+  eventFieldSizes = { data: 0, event: 0, id: 0, retry: 0 }
+  dataLineCount = 0
+  maxEventSize
+  maxDataLines
+  maxBufferedChunks
 
   event = {
     data: undefined,
@@ -15092,6 +15122,7 @@ class EventSourceStream extends Transform {
 
   /**
    * @param {object} options
+   * @param {number} [options.maxEventSize]
    * @param {eventSourceSettings} options.eventSourceSettings
    * @param {Function} [options.push]
    */
@@ -15103,6 +15134,12 @@ class EventSourceStream extends Transform {
     super(options)
 
     this.state = options.eventSourceSettings || {}
+    this.maxEventSize = options.maxEventSize ?? defaultMaxEventSize
+    const parserItemLimit = this.maxEventSize > 0
+      ? Math.min(maxParserItems, Math.max(minParserItems, Math.floor(this.maxEventSize / bytesPerParserItem)))
+      : 0
+    this.maxDataLines = parserItemLimit
+    this.maxBufferedChunks = parserItemLimit
     if (options.push) {
       this.push = options.push
     }
@@ -15120,6 +15157,14 @@ class EventSourceStream extends Transform {
       return
     }
 
+    // A leading line ending can immediately release the currently buffered
+    // line, even when it uses the final allowed chunk slot.
+    if (this.maxEventSize > 0 &&
+        this.chunks.length >= this.maxBufferedChunks &&
+        chunk[0] !== LF && chunk[0] !== CR) {
+      callback(createMaxEventSizeExceededError())
+      return
+    }
     this.chunks.push(chunk)
 
     // Strip leading byte-order-mark if we opened the stream and started
@@ -15198,7 +15243,12 @@ class EventSourceStream extends Transform {
 
         // In any case, we can process the line as we reached an
         // end-of-line character
-        this.parseLine(this.readLine(), this.event)
+        try {
+          this.parseLine(this.readLine(), this.event)
+        } catch (error) {
+          callback(error)
+          return
+        }
         this.consumeCurrentByte()
         // A line was processed and this could be the end of the event. We need
         // to check if the next line is empty to determine if the event is
@@ -15207,15 +15257,28 @@ class EventSourceStream extends Transform {
         continue
       }
 
+      // readLine() is only called after CR or LF. Reject an unfinished line
+      // before it can retain an unbounded number of decoded chunks. The seven
+      // extra bytes allow the longest field prefix ("event: " or "retry: ").
+      if (this.maxEventSize > 0 && ++this.lineLength > this.maxEventSize + 7) {
+        callback(createMaxEventSizeExceededError())
+        return
+      }
       this.advanceCursor()
     }
 
     callback()
   }
 
+  _destroy (error, callback) {
+    this.chunks.length = 0
+    this.clearEvent()
+    super._destroy(error, callback)
+  }
+
   /**
    * @param {Buffer} line
-   * @param {EventStreamEvent} event
+   * @param {EventSourceStreamEvent} event
    */
   parseLine (line, event) {
     // If the line is empty (a blank line)
@@ -15249,6 +15312,13 @@ class EventSourceStream extends Transform {
     }
 
     if (isFieldName(line, fieldLength, DATA)) {
+      if (this.maxEventSize > 0 && this.dataLineCount >= this.maxDataLines) {
+        throw createMaxEventSizeExceededError()
+      }
+      const valueBytes = line.length - valueStart
+      const dataSize = this.eventFieldSizes.data + (event.data === undefined ? 0 : 1) + valueBytes
+      this.setEventFieldSize('data', dataSize)
+
       const value = line.toString('utf8', valueStart)
 
       if (event.data === undefined) {
@@ -15256,11 +15326,13 @@ class EventSourceStream extends Transform {
       } else {
         event.data += `\n${value}`
       }
+      this.dataLineCount++
       return
     }
 
     if (isFieldName(line, fieldLength, RETRY)) {
       if (isASCIINumberBytes(line, valueStart)) {
+        this.setEventFieldSize('retry', line.length - valueStart)
         event.retry = line.toString('utf8', valueStart)
       }
       return
@@ -15268,18 +15340,27 @@ class EventSourceStream extends Transform {
 
     if (isFieldName(line, fieldLength, ID)) {
       if (isValidLastEventIdBytes(line, valueStart)) {
+        this.setEventFieldSize('id', line.length - valueStart)
         event.id = line.toString('utf8', valueStart)
       }
       return
     }
 
     if (isFieldName(line, fieldLength, EVENT)) {
-      const value = line.toString('utf8', valueStart)
-
-      if (value.length > 0) {
-        event.event = value
+      if (valueStart < line.length) {
+        this.setEventFieldSize('event', line.length - valueStart)
+        event.event = line.toString('utf8', valueStart)
       }
     }
+  }
+
+  setEventFieldSize (field, size) {
+    const eventSize = this.eventSize - this.eventFieldSizes[field] + size
+    if (this.maxEventSize > 0 && eventSize > this.maxEventSize) {
+      throw createMaxEventSizeExceededError()
+    }
+    this.eventSize = eventSize
+    this.eventFieldSizes[field] = size
   }
 
   /**
@@ -15312,6 +15393,12 @@ class EventSourceStream extends Transform {
     this.event.event = undefined
     this.event.id = undefined
     this.event.retry = undefined
+    this.eventSize = 0
+    this.dataLineCount = 0
+    this.eventFieldSizes.data = 0
+    this.eventFieldSizes.event = 0
+    this.eventFieldSizes.id = 0
+    this.eventFieldSizes.retry = 0
   }
 
   hasPendingEvent () {
@@ -15347,14 +15434,16 @@ class EventSourceStream extends Transform {
   syncLineStartToCursor () {
     this.lineChunkIndex = this.chunkIndex
     this.linePos = this.pos
+    this.lineLength = 0
     this.dropConsumedChunks()
   }
 
   dropConsumedChunks () {
-    while (this.lineChunkIndex > 0) {
-      this.chunks.shift()
-      this.lineChunkIndex--
-      this.chunkIndex--
+    if (this.lineChunkIndex > 0) {
+      const consumed = this.lineChunkIndex
+      this.chunks.splice(0, consumed)
+      this.lineChunkIndex = 0
+      this.chunkIndex -= consumed
     }
 
     if (this.chunkIndex === this.chunks.length) {
@@ -15479,6 +15568,7 @@ const { isNetworkError } = __nccwpck_require__(9051)
 const { delay } = __nccwpck_require__(4811)
 const { kEnumerableProperty } = __nccwpck_require__(3440)
 const { environmentSettingsObject } = __nccwpck_require__(3168)
+const { getGlobalDispatcher } = __nccwpck_require__(2581)
 
 let experimentalWarned = false
 
@@ -15760,6 +15850,7 @@ class EventSource extends EventTarget {
 
       const eventSourceStream = new EventSourceStream({
         eventSourceSettings: this.#state,
+        maxEventSize: this.#dispatcher.eventSourceOptions?.maxEventSize,
         push: (event) => {
           this.dispatchEvent(createFastMessageEvent(
             event.type,
@@ -15938,7 +16029,8 @@ webidl.converters.EventSourceInitDict = webidl.dictionaryConverter([
   },
   {
     key: 'dispatcher', // undici only
-    converter: webidl.converters.any
+    converter: webidl.converters.any,
+    defaultValue: () => getGlobalDispatcher()
   }
 ])
 
@@ -21034,8 +21126,10 @@ async function httpNetworkFetch (
   // 19. Run these steps in parallel:
 
   //    1. Run these steps, but abort when fetchParams is canceled:
-  fetchParams.controller.onAborted = onAborted
-  fetchParams.controller.on('terminated', onAborted)
+  if (!fetchParams.controller.resume) {
+    fetchParams.controller.on('terminated', onAborted)
+  }
+
   fetchParams.controller.resume = async () => {
     // 1. While true
     while (true) {
@@ -21204,8 +21298,6 @@ async function httpNetworkFetch (
           }
           location = headersList.get('location', true)
 
-          this.body = new Readable({ read: resume })
-
           const decoders = []
 
           const willFollow = location && request.redirect === 'follow' &&
@@ -21223,7 +21315,7 @@ async function httpNetworkFetch (
             // CVE fix similar to urllib3 (GHSA-gm62-xv2j-4w53) and curl (CVE-2022-32206).
             const maxContentEncodings = 5
             if (codings.length > maxContentEncodings) {
-              reject(new Error(`too many content-encodings in response: ${codings.length}, maximum allowed is ${maxContentEncodings}`))
+              this.abort(new Error(`too many content-encodings in response: ${codings.length}, maximum allowed is ${maxContentEncodings}`))
               return true
             }
 
@@ -21255,6 +21347,8 @@ async function httpNetworkFetch (
               }
             }
           }
+
+          this.body = new Readable({ read: resume })
 
           const onError = this.onError.bind(this)
 
@@ -21300,10 +21394,6 @@ async function httpNetworkFetch (
         onComplete () {
           if (this.abort) {
             fetchParams.controller.off('terminated', this.abort)
-          }
-
-          if (fetchParams.controller.onAborted) {
-            fetchParams.controller.off('terminated', fetchParams.controller.onAborted)
           }
 
           fetchParams.controller.ended = true
@@ -27780,6 +27870,20 @@ class ByteParser extends Writable {
         if (isControlFrame(this.#info.opcode)) {
           this.#loop = this.parseControlFrame(body)
           this.#state = parserStates.INFO
+
+          // If the automatic PONG/CLOSE reply filled the socket's write buffer,
+          // stop parsing and resume on drain so a PING flood cannot grow the
+          // outbound queue without bound.
+          const socket = this.ws[kResponse].socket
+          if (this.#loop && socket.writableNeedDrain) {
+            this.#loop = false
+            socket.once('drain', () => {
+              if (this.destroyed) return
+              this.#loop = true
+              this.run(callback)
+            })
+            return
+          }
         } else {
           if (!this.#info.compressed) {
             if (!this.writeFragments(body)) {
@@ -46117,26 +46221,6 @@ var APIPromise = class APIPromise extends Promise {
 		return this.#parse().finally(onfinally);
 	}
 };
-//#endregion
-//#region src/env.ts
-/** Environment variable names for client configuration. Explicit options take precedence. */
-const ENV = {
-	/** Required API key; used when `apiKey` is omitted. */
-	apiKey: "TYPESAFE_API_KEY",
-	/** API root; defaults to `https://api.typesafe.ai`. */
-	baseURL: "TYPESAFE_BASE_URL",
-	/** Default model name; defaults to `jev-latest`. */
-	defaultModel: "TYPESAFE_DEFAULT_MODEL",
-	/** Log level; defaults to `warn`. */
-	logLevel: "TYPESAFE_LOG_LEVEL"
-};
-/** Read a trimmed environment value, returning `undefined` for missing or blank values. */
-const readEnv = (name) => {
-	if (typeof process === "undefined" || !process.env) return void 0;
-	return process.env[name]?.trim() || void 0;
-};
-/** Return the explicit value, falling back to the environment. */
-const fromCodeOrEnv = (fromCode, envVar) => fromCode ?? readEnv(envVar);
 const range = (from, to) => Array.from({ length: to - from }, (_, i) => from + i);
 /** Default SDK retry policy. */
 const DEFAULT_RETRY_POLICY = {
@@ -46307,6 +46391,349 @@ var APIUserAbortError = class extends TypeSafeError {
 	}
 };
 //#endregion
+//#region src/assets.ts
+/**
+* The file signatures that PNG (PNG spec §5.2) and JPEG (ITU T.81 SOI marker) files start
+* with, and the content type each identifies.
+*/
+const CONTENT_TYPES = [["image/png", [
+	137,
+	80,
+	78,
+	71,
+	13,
+	10,
+	26,
+	10
+]], ["image/jpeg", [
+	255,
+	216,
+	255
+]]];
+/** Matches `String(image)`: the reference an image is sent under. */
+const REFERENCE = /<image:[0-9a-f]{32}>/g;
+/** Marks `Image` objects, including those created by another copy of the SDK. */
+const IMAGE = Symbol.for("@typesafe-ai/sdk/image");
+/** Marks `TextWithAssets` objects, including those created by another copy of the SDK. */
+const TEXT_WITH_ASSETS = Symbol.for("@typesafe-ai/sdk/text-with-assets");
+/** 32 random lowercase hex digits. */
+const randomHex = () => Array.from(crypto.getRandomValues(/* @__PURE__ */ new Uint8Array(16)), (byte) => byte.toString(16).padStart(2, "0")).join("");
+const isImage = (value) => IMAGE in value;
+const isTextWithAssets = (value) => TEXT_WITH_ASSETS in value;
+/** `value`'s `Symbol.toStringTag`, such as `Promise`, or its `typeof` when it isn't an object. */
+const typeName = (value) => {
+	if (value === null) return "null";
+	if (typeof value !== "object") return typeof value;
+	return Object.prototype.toString.call(value).slice(8, -1);
+};
+/** A `Uint8Array` over the bytes `data` holds or views, without copying them. */
+const toBytes = (data) => {
+	if (!ArrayBuffer.isView(data) && Object.prototype.toString.call(data) !== "[object ArrayBuffer]") throw new TypeSafeError(`Image data must be file bytes or a Blob; got ${typeName(data)}.`);
+	return ArrayBuffer.isView(data) ? new Uint8Array(data.buffer, data.byteOffset, data.byteLength) : new Uint8Array(data);
+};
+/** The content type whose signature `bytes` start with, or `application/octet-stream`. */
+const contentTypeOf = (bytes) => {
+	for (const [contentType, signature] of CONTENT_TYPES) if (signature.every((byte, i) => bytes[i] === byte)) return contentType;
+	return "application/octet-stream";
+};
+/** A PNG or JPEG image asset, created by `image` or `Image.fromBase64`. */
+var Image = class Image {
+	type = "image";
+	/** The image file bytes, or a `Blob` read when the request is sent. */
+	data;
+	#reference = `<image:${randomHex()}>`;
+	/** @throws {TypeSafeError} `data` is empty or isn't file bytes or a `Blob`. */
+	constructor(data) {
+		this.data = data instanceof Blob ? data : toBytes(data);
+		if ((this.data instanceof Blob ? this.data.size : this.data.byteLength) === 0) throw new TypeSafeError("Image data is empty.");
+	}
+	/**
+	* Create an image from base64-encoded file bytes, decoding them now.
+	*
+	* @param text - The image file bytes, base64-encoded, without a `data:` URL prefix.
+	* @throws {TypeSafeError} `text` isn't valid base64 or decodes to no bytes.
+	*
+	* @example
+	* ```ts
+	* const photo = Image.fromBase64(upload.photoBase64);
+	* ```
+	*/
+	static fromBase64(text) {
+		let binary;
+		try {
+			binary = atob(text);
+		} catch (err) {
+			throw new TypeSafeError("Image data must contain valid base64 text.", { cause: err });
+		}
+		return new Image(Uint8Array.from(binary, (char) => char.charCodeAt(0)));
+	}
+	/** The unique reference this image is sent under, for referencing it inside text. */
+	toString() {
+		return this.#reference;
+	}
+	/** The reference, written by `JSON.stringify` wherever the image appears in a request. */
+	toJSON() {
+		return this.#reference;
+	}
+};
+Object.defineProperty(Image.prototype, IMAGE, { value: true });
+/** Text from a `withAssets` tagged template, with the assets interpolated into it. */
+var TextWithAssets = class {
+	/** The text, with each asset replaced by its reference. */
+	text;
+	/** The assets interpolated into the text, including those in nested `withAssets` text. */
+	assets;
+	constructor(text, assets) {
+		this.text = text;
+		this.assets = assets;
+	}
+	toString() {
+		return this.text;
+	}
+	/** The text, written by `JSON.stringify` wherever this value appears in a request. */
+	toJSON() {
+		return this.text;
+	}
+};
+Object.defineProperty(TextWithAssets.prototype, TEXT_WITH_ASSETS, { value: true });
+/**
+* Create an image asset for `systemOne`.
+*
+* Place the image in `state` or question content, or interpolate it into a `withAssets`
+* tagged template; either way it is sent under its own reference, `String(image)`. To
+* reference it by a name of your choice, pass it in `assets` instead.
+*
+* The image must be PNG or JPEG. The API detects the format from the file bytes and rejects
+* other formats with a `BadRequestError`. `Blob` data is read when the request is sent, and its
+* `type` is ignored. For base64 text, use `Image.fromBase64`.
+*
+* @param data - Image file bytes, or a `Blob` such as a `File`.
+* @throws {TypeSafeError} `data` is empty or isn't file bytes or a `Blob`.
+*
+* @example
+* ```ts
+* // Node: `openAsBlob` reads a file as a Blob and is exported by "node:fs".
+* const { answers } = await client.systemOne({
+*   state: image(await openAsBlob("product.png")),
+*   questions: { damaged: noul("Is the product damaged?") },
+* });
+* ```
+*/
+const dist_image = (data) => new Image(data);
+/** `text` with the assets in `values` whose references it contains, in order of appearance. */
+const textWithAssets = (text, values) => {
+	const interpolated = /* @__PURE__ */ new Map();
+	collectAssets(values, interpolated, /* @__PURE__ */ new Set());
+	const assets = /* @__PURE__ */ new Map();
+	for (const [reference] of text.matchAll(REFERENCE)) {
+		const asset = interpolated.get(reference);
+		if (asset !== void 0) assets.set(reference, asset);
+	}
+	return new TextWithAssets(text, [...assets.values()]);
+};
+/**
+* Tag a template literal so the assets interpolated into it are sent with the text.
+*
+* Each asset is replaced by its reference; other values are converted to strings, as in an
+* untagged template literal. To write a list of assets with a separator, use
+* `withAssets.join`.
+*
+* @example
+* ```ts
+* const { answers } = await client.systemOne({
+*   state: withAssets`Compare ${photo} with the listing.`,
+*   questions: { same: noul(withAssets`Is ${photo} the product in ${listing}?`) },
+* });
+* ```
+*/
+const withAssets = Object.assign((strings, ...values) => textWithAssets(strings.reduce((joined, piece, i) => joined + String(values[i - 1]) + piece), values), { join: (values, separator) => textWithAssets(values.join(separator), values) });
+/** Add the assets in `value`, including those in `withAssets` text, to `found` by reference. */
+const collectAssets = (value, found, visited) => {
+	if (typeof value !== "object" || value === null || visited.has(value)) return;
+	visited.add(value);
+	if (isImage(value)) found.set(String(value), value);
+	else if (isTextWithAssets(value)) for (const asset of value.assets) found.set(String(asset), asset);
+	else for (const item of Object.values(value)) collectAssets(item, found, visited);
+};
+/**
+* Serialize `payload` to JSON, writing each asset as its name in `assets`, or else as its
+* reference, and collect the assets the request sends.
+*
+* The assets are those in `assets`, then each asset whose reference appears in the JSON, in
+* order of appearance: assets placed in content, in `withAssets` text, or in `assets`.
+*
+* @throws {TypeSafeError} The JSON holds the reference of an asset not attached to the request,
+*   or doesn't contain the name of an asset in `assets`.
+*/
+const serializeRequest = (payload, assets = {}) => {
+	const names = new Map(Object.entries(assets).map(([name, asset]) => [asset, name]));
+	const known = new Map(Object.values(assets).map((asset) => [String(asset), asset]));
+	const json = JSON.stringify(payload, function(key, value) {
+		if (typeof value === "number" && !Number.isFinite(value)) return String(value);
+		const original = this[key];
+		if (typeof original !== "object" || original === null) return value;
+		if (isImage(original)) {
+			const name = names.get(original);
+			if (name !== void 0) return name;
+			known.set(String(original), original);
+		} else if (isTextWithAssets(original)) {
+			let text = original.text;
+			for (const asset of original.assets) {
+				const name = names.get(asset);
+				if (name === void 0) known.set(String(asset), asset);
+				else text = text.replaceAll(String(asset), name);
+			}
+			return text;
+		}
+		return value;
+	});
+	const unreferenced = Object.keys(assets).filter((name) => !json.includes(JSON.stringify(name).slice(1, -1)));
+	if (unreferenced.length > 0) throw new TypeSafeError(`Assets not referenced in the request: ${unreferenced.join(", ")}. Write each name in \`assets\` into \`state\`, question instructions, or criteria.`);
+	const sent = new Map(Object.entries(assets));
+	const missing = /* @__PURE__ */ new Set();
+	for (const [reference] of json.matchAll(REFERENCE)) {
+		if (sent.has(reference)) continue;
+		const asset = known.get(reference);
+		if (asset === void 0) missing.add(reference);
+		else sent.set(reference, asset);
+	}
+	if (missing.size > 0) throw new TypeSafeError(`Image references without an attached image: ${[...missing].join(", ")}. Tag template literals that interpolate images with \`withAssets\`.`);
+	return {
+		json,
+		assets: sent.size === 0 ? void 0 : Object.fromEntries(sent)
+	};
+};
+/** A `multipart/form-data` request body (RFC 7578) whose first part is a JSON payload. */
+var MultipartBody = class {
+	/** The JSON payload, sent as the `request` part. */
+	payload;
+	/** The `Content-Type` header value, including the boundary. */
+	contentType;
+	/** The encoded body. */
+	content;
+	constructor(payload, parts) {
+		const boundary = randomHex();
+		const chunks = [];
+		for (const { name, contentType, content, filename } of [{
+			name: "request",
+			contentType: "application/json",
+			content: JSON.stringify(payload)
+		}, ...parts]) {
+			const disposition = filename === void 0 ? `name="${name}"` : `name="${name}"; filename="${filename}"`;
+			chunks.push(`--${boundary}\r\nContent-Disposition: form-data; ${disposition}\r\n`, `Content-Type: ${contentType}\r\n\r\n`, content, "\r\n");
+		}
+		chunks.push(`--${boundary}--\r\n`);
+		this.payload = payload;
+		this.contentType = `multipart/form-data; boundary=${boundary}`;
+		this.content = new Blob(chunks);
+	}
+};
+/** The image's file bytes, reading `Blob` data. */
+const readImage = async (alias, { data }) => {
+	if (!(data instanceof Blob)) return data;
+	try {
+		return new Uint8Array(await data.arrayBuffer());
+	} catch (err) {
+		throw new TypeSafeError(`Asset "${alias}" could not be read: ${err.message}`, { cause: err });
+	}
+};
+/** `bytes`, copied when backed by a `SharedArrayBuffer`, which `Blob` doesn't accept. */
+const unshared = (bytes) => bytes.buffer instanceof ArrayBuffer ? bytes : bytes.slice();
+/**
+* `assets`, with each asset's file bytes copied, so writes to the caller's buffers after this
+* call don't change what is sent. `Blob` data can't change, and isn't copied.
+*/
+const copyAssetBytes = (assets) => Object.fromEntries(Object.entries(assets).map(([alias, asset]) => [alias, asset.data instanceof Uint8Array ? new Image(asset.data.slice()) : asset]));
+/**
+* A `multipart/form-data` body whose first part, `request`, is `payload` with `assets` added,
+* followed by each asset's file bytes in a part its entry names. `Blob` data is read
+* concurrently.
+*
+* @throws {TypeSafeError} A `Blob` can't be read.
+*/
+const encodeAssets = async (payload, assets) => {
+	const read = await Promise.all(Object.entries(assets).map(async ([alias, asset]) => [
+		alias,
+		asset,
+		await readImage(alias, asset)
+	]));
+	const parts = [];
+	const entries = [];
+	for (const [alias, { type }, data] of read) {
+		const name = `asset-${parts.length}`;
+		parts.push({
+			name,
+			contentType: contentTypeOf(data),
+			content: unshared(data),
+			filename: name
+		});
+		entries.push([alias, {
+			type,
+			part: name
+		}]);
+	}
+	return new MultipartBody({
+		...payload,
+		assets: Object.fromEntries(entries)
+	}, parts);
+};
+const g$1 = globalThis;
+/** `node:zlib`, read without an import so the SDK still loads where Node modules don't exist. */
+const zlib = () => {
+	try {
+		return g$1.process?.getBuiltinModule?.("node:zlib");
+	} catch {
+		return;
+	}
+};
+const hasZstd = () => typeof zlib()?.zstdCompress === "function";
+/**
+* Resolve the `compression` option to the `Content-Encoding` request bodies are sent with:
+* zstd when the runtime has it, otherwise `false`.
+*
+* @throws {TypeSafeError} The value isn't a supported option, or the runtime lacks it.
+*/
+const resolveCompression = (compression) => {
+	if (compression === void 0) return hasZstd() ? "zstd" : false;
+	if (compression === false) return false;
+	if (compression === "zstd") {
+		if (!hasZstd()) throw new TypeSafeError("zstd compression requires Node.js 22.15 or newer. Pass `compression: false` instead.");
+		return compression;
+	}
+	throw new TypeSafeError(`\`compression\` must be "zstd" or false, got ${JSON.stringify(compression)}.`);
+};
+const zstd = async (body) => {
+	const data = new Uint8Array(await body.arrayBuffer());
+	const compressed = await new Promise((resolve, reject) => {
+		zlib()?.zstdCompress?.(data, (err, result) => err ? reject(err) : resolve(result));
+	});
+	return new Uint8Array(compressed);
+};
+/** The size of a request body in bytes, with text measured as UTF-8. */
+const byteLength = (body) => typeof body === "string" ? new TextEncoder().encode(body).byteLength : body.size;
+/** Compress a request body with zstd. */
+const compressBody = (body) => zstd(typeof body === "string" ? new Blob([body]) : body);
+//#endregion
+//#region src/env.ts
+/** Environment variable names for client configuration. Explicit options take precedence. */
+const ENV = {
+	/** Required API key; used when `apiKey` is omitted. */
+	apiKey: "TYPESAFE_API_KEY",
+	/** API root; defaults to `https://api.typesafe.ai`. */
+	baseURL: "TYPESAFE_BASE_URL",
+	/** Default model name; defaults to `jev-latest`. */
+	defaultModel: "TYPESAFE_DEFAULT_MODEL",
+	/** Log level; defaults to `warn`. */
+	logLevel: "TYPESAFE_LOG_LEVEL"
+};
+/** Read a trimmed environment value, returning `undefined` for missing or blank values. */
+const readEnv = (name) => {
+	if (typeof process === "undefined" || !process.env) return void 0;
+	return process.env[name]?.trim() || void 0;
+};
+/** Return the explicit value, falling back to the environment. */
+const fromCodeOrEnv = (fromCode, envVar) => fromCode ?? readEnv(envVar);
+//#endregion
 //#region src/logging.ts
 /** Supported log levels, from most to least verbose. */
 const LOG_LEVELS = [
@@ -46376,8 +46803,9 @@ const redactHeaders = (headers) => Object.fromEntries(Object.entries(headers).ma
 /**
 * Create a yes/no question with optional descriptions for either outcome.
 *
-* @param instructions - The question as text, a JSON object or array; defaults to `null`.
-* @param criteria - Optional descriptions of the yes and no outcomes.
+* @param instructions - The question as text, a JSON object or array; `null` or omitted
+* requires `criteria` to describe at least one outcome.
+* @param criteria - Descriptions of the yes and no outcomes.
 */
 const noul = (instructions = null, criteria) => ({
 	type: "noul",
@@ -46389,13 +46817,16 @@ const noul = (instructions = null, criteria) => ({
 *
 * @param instructions - The question as text, a JSON object or array, or `null`.
 * @param criteria - At least two descriptions indexed by score from zero; entries may be `null`.
+*   A list built at runtime, such as a `string[]`, is accepted, and `systemOne` rejects it when
+*   it has fewer than two entries.
 */
 const score = (instructions, criteria) => {
+	const rubric = criteria;
 	if (!Array.isArray(criteria)) throw new TypeSafeError("Score criteria must be a list of descriptions indexed by score from zero, not a map.");
 	return {
 		type: "score",
 		instructions,
-		criteria
+		criteria: rubric
 	};
 };
 /**
@@ -46412,10 +46843,45 @@ const choice = (instructions, criteria) => {
 		criteria
 	};
 };
-/** Reject empty question sets and score questions without a list of at least two criteria. */
+/**
+* Create a question that locates what its instructions describe in the request's image.
+* Use the `jev-preview` model for `box` questions.
+*
+* @param instructions - What to locate, as text, an asset, a JSON object or array; defaults to `null`.
+*
+* @example
+* ```ts
+* const { answers } = await client.systemOne({
+*   state: image(await openAsBlob("photo.jpg")),
+*   questions: { dog: box("The dog") },
+*   model: "jev-preview",
+* });
+* const { top, bottom, left, right } = answers.dog.box;
+* ```
+*/
+const box = (instructions = null) => ({
+	type: "box",
+	instructions
+});
+const isObject = (value) => typeof value === "object" && value !== null && !Array.isArray(value);
+const validateChoice = (name, { criteria }) => {
+	if (!isObject(criteria)) throw new TypeSafeError(`Choice question "${name}" has criteria that are not a map; choice criteria must be a map of labels to descriptions.`);
+	if (Object.keys(criteria).length === 0) throw new TypeSafeError(`Choice question "${name}" has no criteria; at least one choice is required.`);
+};
+const validateNoul = (name, { instructions, criteria }) => {
+	if (criteria != null && !isObject(criteria)) throw new TypeSafeError(`Noul question "${name}" criteria must be an object.`);
+	if (instructions == null && !Object.values(criteria ?? {}).some((value) => value != null)) throw new TypeSafeError(`Noul question "${name}" has neither instructions nor criteria; at least one is required.`);
+};
+/**
+* Reject empty question sets, score questions without a list of at least two criteria, choice
+* questions without a nonempty map of criteria, and noul questions with non-object criteria or
+* with neither instructions nor a described outcome.
+*/
 const validateQuestions = (questions) => {
 	if (Object.keys(questions).length === 0) throw new TypeSafeError("At least one question is required.");
 	for (const [name, question] of Object.entries(questions)) {
+		if (question.type === "choice") validateChoice(name, question);
+		if (question.type === "noul") validateNoul(name, question);
 		if (question.type !== "score") continue;
 		if (!Array.isArray(question.criteria)) throw new TypeSafeError(`Score question "${name}" has criteria that are not a list; score criteria must be a list of descriptions indexed by score from zero.`);
 		if (question.criteria.length < 2) throw new TypeSafeError(`Score question "${name}" has ${question.criteria.length} criteria; at least two scores are required.`);
@@ -46456,7 +46922,7 @@ const describeRuntime = () => {
 };
 //#endregion
 //#region src/version.ts
-const dist_VERSION = "0.6.0";
+const dist_VERSION = "0.7.0";
 const missingApiKey = () => {
 	throw new TypeSafeError(`No API key was provided. Pass \`apiKey\` to the TypeSafeClient constructor or set the ${ENV.apiKey} environment variable.`);
 };
@@ -46528,9 +46994,10 @@ const mergeHeaders = (...sources) => {
 const bufferResponse = async (response, signal) => {
 	const reader = response.clone().body?.getReader();
 	if (!reader) return;
+	const original = response.body?.getReader();
 	const cancel = () => {
 		reader.cancel(signal.reason).catch(() => {});
-		response.body?.cancel(signal.reason).catch(() => {});
+		original?.cancel(signal.reason).catch(() => {});
 	};
 	signal.addEventListener("abort", cancel, { once: true });
 	try {
@@ -46541,10 +47008,35 @@ const bufferResponse = async (response, signal) => {
 	} finally {
 		signal.removeEventListener("abort", cancel);
 		reader.releaseLock();
+		original?.releaseLock();
 	}
+};
+/**
+* Call `start` and settle with its result, or reject with the signal's reason when the signal
+* aborts first. `start` isn't called if the signal has already aborted.
+*/
+const untilAborted = (start, signal) => {
+	if (signal === void 0) return start();
+	return new Promise((resolve, reject) => {
+		if (signal.aborted) return reject(signal.reason);
+		const onAbort = () => reject(signal.reason);
+		signal.addEventListener("abort", onAbort, { once: true });
+		start().then((value) => {
+			signal.removeEventListener("abort", onAbort);
+			resolve(value);
+		}, (err) => {
+			signal.removeEventListener("abort", onAbort);
+			reject(err);
+		});
+	});
 };
 /** Runtime description cached for the process lifetime. */
 const RUNTIME = describeRuntime();
+/** An `APIPromise` rejected with `err`, for failures found before a request is sent. */
+const rejectedAPIPromise = (err) => {
+	const response = Promise.reject(err);
+	return new APIPromise(response, () => response);
+};
 /** Client for the TypeSafe AI API. */
 var TypeSafeClient = class {
 	/** API key excluded from serialization and public properties. */
@@ -46563,6 +47055,8 @@ var TypeSafeClient = class {
 	timeout;
 	/** Additional headers sent with each request. */
 	defaultHeaders;
+	/** Request body compression, or `false` when bodies are sent uncompressed. */
+	compression;
 	/** HTTP fetch implementation. */
 	fetch;
 	/** The models available to the account. */
@@ -46574,7 +47068,8 @@ var TypeSafeClient = class {
 	* Explicit options take precedence over environment variables, then SDK defaults.
 	* Empty or whitespace-only environment values are ignored.
 	*
-	* @throws {TypeSafeError} The API key is missing, configuration is invalid, or the runtime is unsupported.
+	* @throws {TypeSafeError} The API key is missing, configuration is invalid, the runtime is
+	*   unsupported, or the runtime lacks the requested compression.
 	*/
 	constructor(config = {}) {
 		if (isBrowser() && !config.dangerouslyAllowBrowser) refuseBrowser();
@@ -46586,6 +47081,7 @@ var TypeSafeClient = class {
 		this.retry = resolveRetryPolicy(DEFAULT_RETRY_POLICY, config.retry);
 		this.timeout = assertPositiveMs("timeout", config.timeout ?? 1e4);
 		this.defaultHeaders = { ...config.defaultHeaders };
+		this.compression = resolveCompression(config.compression);
 		if (config.fetch === void 0 && typeof globalThis.fetch !== "function") missingFetch();
 		this.fetch = config.fetch ?? defaultFetch;
 		const transport = {
@@ -46595,12 +47091,18 @@ var TypeSafeClient = class {
 		this.models = new Models(transport);
 	}
 	/**
-	* Answer named questions about text or structured state.
+	* Answer named questions about text, structured state, or assets.
 	*
-	* @param request - State, questions, and an optional model override.
+	* @param request - State, questions, an optional model override, and optional assets.
+	*   Assets in `state`, question content, or `withAssets` text are sent under their references.
 	* @param options - Per-call timeout, retry, headers, and cancellation settings.
-	* @returns Answers typed by question name and criteria, with model and token usage.
-	* @throws {TypeSafeError} Questions are empty, or score criteria are not a list of at least two entries.
+	* @returns Answers typed by question name and criteria, with model and token usage. Every
+	*   failure below rejects the returned promise; the call itself doesn't throw.
+	* @throws {TypeSafeError} State is `null` or omitted, questions are empty, score criteria are not
+	*   a list of at least two entries, choice criteria are not a nonempty map, a noul question has
+	*   neither instructions nor a described outcome, a string holds the reference of an asset not
+	*   attached to the request, a name in `assets` doesn't appear in the request, or a `Blob`
+	*   asset can't be read.
 	* @throws {APIError} The server returns a non-2xx response after retries.
 	* @throws {APIConnectionError} The request cannot connect or times out after retries.
 	* @throws {APIUserAbortError} The caller aborts the request.
@@ -46615,11 +47117,21 @@ var TypeSafeClient = class {
 	* ```
 	*/
 	systemOne(request, options = {}) {
-		validateQuestions(request.questions);
-		const body = {
-			...request,
-			model: request.model ?? this.defaultModel
-		};
+		let body;
+		try {
+			if (request.state == null) throw new TypeSafeError("State is required.");
+			validateQuestions(request.questions);
+			const { assets, ...rest } = request;
+			const { json, assets: sent } = serializeRequest({
+				...rest,
+				model: request.model ?? this.defaultModel
+			}, assets);
+			const payload = JSON.parse(json);
+			const copied = sent === void 0 ? void 0 : copyAssetBytes(sent);
+			body = copied === void 0 ? payload : () => encodeAssets(payload, copied);
+		} catch (err) {
+			return rejectedAPIPromise(err);
+		}
 		return this.#request("POST", "/v1/systemone", {
 			...options,
 			body
@@ -46627,15 +47139,20 @@ var TypeSafeClient = class {
 	}
 	/** Send a request and parse its response body. */
 	#request(method, path, options = {}) {
-		const resolved = {
-			method,
-			path,
-			body: options.body,
-			headers: mergeHeaders(this.defaultHeaders, options.headers ?? {}),
-			signal: options.signal,
-			timeout: options.timeout === void 0 ? this.timeout : assertPositiveMs("timeout", options.timeout),
-			retry: resolveRetryPolicy(this.retry, options.retry)
-		};
+		let resolved;
+		try {
+			resolved = {
+				method,
+				path,
+				body: options.body,
+				headers: mergeHeaders(this.defaultHeaders, options.headers ?? {}),
+				signal: options.signal,
+				timeout: options.timeout === void 0 ? this.timeout : assertPositiveMs("timeout", options.timeout),
+				retry: resolveRetryPolicy(this.retry, options.retry)
+			};
+		} catch (err) {
+			return rejectedAPIPromise(err);
+		}
 		const tag = `#${++this.#requestCount} ${method} ${path}`;
 		return new APIPromise(this.fetchWithRetries(tag, resolved), async (res) => {
 			const parsed = await parseBody(res);
@@ -46646,16 +47163,36 @@ var TypeSafeClient = class {
 	/** Retry eligible failures, logging attempt summaries at `info` and headers and bodies at `debug`. */
 	async fetchWithRetries(tag, req) {
 		const url = `${this.baseURL}${req.path}`;
+		let resolved = req.body;
+		if (typeof resolved === "function") try {
+			resolved = await untilAborted(resolved, req.signal);
+		} catch (err) {
+			if (!req.signal?.aborted) throw err;
+			this.logger.info(`${tag} aborted by caller while reading assets`);
+			throw new APIUserAbortError(void 0, { cause: err });
+		}
+		const multipart = resolved instanceof MultipartBody ? resolved : void 0;
+		const payload = multipart === void 0 ? resolved : multipart.payload;
+		const encoded = multipart?.content ?? (payload === void 0 ? void 0 : JSON.stringify(payload));
+		const encoding = encoded === void 0 || byteLength(encoded) < 1024 ? false : this.compression;
+		let body = encoded;
+		if (encoded !== void 0 && encoding !== false) try {
+			body = await untilAborted(() => compressBody(encoded), req.signal);
+		} catch (err) {
+			if (!req.signal?.aborted) throw err;
+			this.logger.info(`${tag} aborted by caller while compressing the body`);
+			throw new APIUserAbortError(void 0, { cause: err });
+		}
 		const headers = mergeHeaders(req.headers, {
 			Authorization: `Bearer ${this.#apiKey}`,
 			Accept: "application/json",
 			"User-Agent": `typesafe-sdk/${dist_VERSION}`,
 			"X-TypeSafe-SDK": `typesafe-sdk/${dist_VERSION}`,
 			"X-TypeSafe-Runtime": RUNTIME,
-			"Content-Type": req.body === void 0 ? void 0 : "application/json",
+			"Content-Type": multipart?.contentType ?? (body === void 0 ? void 0 : "application/json"),
+			"Content-Encoding": encoding === false ? void 0 : encoding,
 			"X-TypeSafe-Retry-Count": void 0
 		});
-		const body = req.body === void 0 ? void 0 : JSON.stringify(req.body);
 		for (let attempt = 0;; attempt++) {
 			const retriesLeft = req.retry.maxRetries - attempt;
 			const attemptHeaders = attempt === 0 ? headers : {
@@ -46664,7 +47201,7 @@ var TypeSafeClient = class {
 			};
 			this.logger.debug(`${tag} -> ${url}`, {
 				headers: redactHeaders(attemptHeaders),
-				body: req.body
+				body: payload
 			});
 			const started = Date.now();
 			let res;
@@ -46829,7 +47366,7 @@ async function judgeWithSystemOne(summary, opts) {
         overallScore: aggregate(dimensions),
         dataLossRisk: answers.data_loss_risk.noul,
         dimensions,
-        usage: { inputTokens: usage.input_tokens, outputTokens: usage.output_tokens },
+        usage: { inputTokens: usage.input_tokens ?? 0, outputTokens: usage.output_tokens ?? 0 },
     };
 }
 
